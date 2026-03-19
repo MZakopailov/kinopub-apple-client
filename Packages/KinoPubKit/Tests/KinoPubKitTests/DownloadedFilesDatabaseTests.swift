@@ -1,5 +1,5 @@
 //
-//  File.swift
+//  DownloadedFilesDatabaseTests.swift
 //
 //
 //  Created by Kirill Kunst on 22.07.2023.
@@ -9,113 +9,91 @@ import Foundation
 import XCTest
 @testable import KinoPubKit
 
-class DownloadedFilesDatabaseTests: XCTestCase {
+final class DownloadedFilesDatabaseTests: XCTestCase {
+  typealias TestMeta = String
 
-  // MARK: - Test Variables
-
-  var downloadedFilesDatabase: DownloadedFilesDatabase!
+  var downloadedFilesDatabase: DownloadedFilesDatabase<TestMeta>!
   var fileSaverMock: FileSaverMock1!
-
-  // MARK: - Test Setup
 
   override func setUp() {
     super.setUp()
 
-    // Use FileSaverMock instead of the actual FileSaver
     fileSaverMock = FileSaverMock1()
     downloadedFilesDatabase = DownloadedFilesDatabase(fileSaver: fileSaverMock)
   }
 
   override func tearDown() {
+    try? FileManager.default.removeItem(at: fileSaverMock.documentsDirectoryURL)
     downloadedFilesDatabase = nil
     fileSaverMock = nil
     super.tearDown()
   }
 
-  // MARK: - Test Methods
+  func testSaveFilePersistsFileInfo() {
+    let fileInfo = DownloadedFileInfo(originalURL: URL(string: "http://example.com/testfile.txt")!,
+                                      localFilename: "testfile.txt",
+                                      downloadDate: Date(),
+                                      metadata: "meta")
 
-  func testSaveFile_Success() {
-    // Arrange
-    let originalURL = URL(string: "http://example.com/testfile.txt")!
-    let localFilename = "testfile.txt"
-    let downloadDate = Date()
-    let fileInfo = DownloadedFileInfo(originalURL: originalURL, localFilename: localFilename, downloadDate: downloadDate)
-
-    // Act
     downloadedFilesDatabase.save(fileInfo: fileInfo)
 
-    // Assert
-    XCTAssertTrue(fileSaverMock.didMoveItem)
+    XCTAssertEqual(downloadedFilesDatabase.readData(), [fileInfo])
   }
 
-  func testSaveFile_ThrowsError() {
-    // Arrange
-    fileSaverMock.shouldThrowError = true
-    let originalURL = URL(string: "http://example.com/testfile.txt")!
-    let localFilename = "testfile.txt"
-    let downloadDate = Date()
-    let fileInfo = DownloadedFileInfo(originalURL: originalURL, localFilename: localFilename, downloadDate: downloadDate)
+  func testReadDataReturnsNilForInvalidPropertyList() throws {
+    try Data("invalid".utf8).write(to: fileSaverMock.dataFileURL)
 
-    // Act & Assert
-    XCTAssertThrowsError(try downloadedFilesDatabase.save(fileInfo: fileInfo))
-    XCTAssertTrue(fileSaverMock.didRemoveItem)
-    XCTAssertFalse(fileSaverMock.didMoveItem)
+    XCTAssertNil(downloadedFilesDatabase.readData())
   }
 
-  func testReadData_Success() {
-    // Arrange
-    let originalURL1 = URL(string: "http://example.com/testfile1.txt")!
-    let localFilename1 = "testfile1.txt"
-    let downloadDate1 = Date()
+  func testReadDataReturnsNewestItemsFirst() {
+    let older = DownloadedFileInfo(originalURL: URL(string: "http://example.com/old.txt")!,
+                                   localFilename: "old.txt",
+                                   downloadDate: Date(timeIntervalSince1970: 10),
+                                   metadata: "old")
+    let newer = DownloadedFileInfo(originalURL: URL(string: "http://example.com/new.txt")!,
+                                   localFilename: "new.txt",
+                                   downloadDate: Date(timeIntervalSince1970: 20),
+                                   metadata: "new")
 
-    let originalURL2 = URL(string: "http://example.com/testfile2.txt")!
-    let localFilename2 = "testfile2.txt"
-    let downloadDate2 = Date()
+    downloadedFilesDatabase.writeData([older, newer])
 
-    let fileInfo1 = DownloadedFileInfo(originalURL: originalURL1, localFilename: localFilename1, downloadDate: downloadDate1)
-    let fileInfo2 = DownloadedFileInfo(originalURL: originalURL2, localFilename: localFilename2, downloadDate: downloadDate2)
-
-    let testData = [fileInfo1, fileInfo2]
-    let encodedData = try? PropertyListEncoder().encode(testData)
-    fileSaverMock.dataToRead = encodedData
-
-    // Act
-    let retrievedData = downloadedFilesDatabase.readData()
-
-    // Assert
-    XCTAssertNotNil(retrievedData)
-    XCTAssertEqual(retrievedData, testData)
+    XCTAssertEqual(downloadedFilesDatabase.readData(), [newer, older])
   }
 
-  func testReadData_DecodingError() {
-    // Arrange
-    fileSaverMock.dataToRead = "InvalidData".data(using: .utf8) // Invalid encoded data
+  func testRemoveDeletesEntryAndDelegatesFileRemoval() {
+    let fileInfo = DownloadedFileInfo(originalURL: URL(string: "http://example.com/testfile.txt")!,
+                                      localFilename: "testfile.txt",
+                                      downloadDate: Date(),
+                                      metadata: "meta")
+    downloadedFilesDatabase.writeData([fileInfo])
 
-    // Act
-    let retrievedData = downloadedFilesDatabase.readData()
+    downloadedFilesDatabase.remove(fileInfo: fileInfo)
 
-    // Assert
-    XCTAssertNil(retrievedData)
+    XCTAssertEqual(downloadedFilesDatabase.readData(), [])
+    XCTAssertEqual(fileSaverMock.removedFileURLs, [fileInfo.originalURL])
   }
 }
 
-class FileSaverMock1: FileSaving {
-  var shouldThrowError = false
-  var didRemoveItem = false
-  var didMoveItem = false
-  var dataToRead: Data?
+final class FileSaverMock1: FileSaving {
+  let documentsDirectoryURL: URL
+  var removedFileURLs: [URL] = []
+  var dataFileURL: URL {
+    getDocumentsDirectoryURL(forFilename: "downloadedFiles.plist")
+  }
 
-  func saveFile(from sourceURL: URL, to destinationURL: URL) throws {
-    didRemoveItem = true
-    didMoveItem = true
+  init(documentsDirectoryURL: URL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)) {
+    self.documentsDirectoryURL = documentsDirectoryURL
+    try? FileManager.default.createDirectory(at: documentsDirectoryURL, withIntermediateDirectories: true)
+  }
 
-    if shouldThrowError {
-      throw NSError(domain: "FileSaverMockErrorDomain", code: 123, userInfo: nil)
-    }
+  func saveFile(from sourceURL: URL, to destinationURL: URL) throws {}
+
+  func removeFile(at sourceURL: URL) throws {
+    removedFileURLs.append(sourceURL)
   }
 
   func getDocumentsDirectoryURL(forFilename filename: String) -> URL {
-    // Provide a mock URL for testing purposes
-    return URL(string: "file:///path/to/documents/")!.appendingPathComponent(filename)
+    documentsDirectoryURL.appendingPathComponent(filename)
   }
 }

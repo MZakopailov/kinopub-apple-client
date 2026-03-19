@@ -9,6 +9,8 @@ import Foundation
 import OSLog
 import KinoPubLogging
 
+private let downloadManagerBackgroundSessionIdentifier = "com.kinopub.backgroundDownloadSession"
+
 public protocol DownloadManaging {
   associatedtype Meta: Codable & Equatable
   
@@ -22,15 +24,17 @@ public class DownloadManager<Meta: Codable & Equatable>: NSObject, URLSessionDow
   @Published public var activeDownloads: [URL: Download<Meta>] = [:]
   private var fileSaver: FileSaving
   private var database: DownloadedFilesDatabase<Meta>
+  private var backgroundSessionCompletionHandler: (() -> Void)?
 
   public init(fileSaver: FileSaving, database: DownloadedFilesDatabase<Meta>) {
     self.fileSaver = fileSaver
     self.database = database
+    super.init()
+    restoreActiveDownloads()
   }
 
   lazy public var session: URLSession = {
-    let identifier = "com.kinopub.backgroundDownloadSession"
-    let config = URLSessionConfiguration.background(withIdentifier: identifier)
+    let config = URLSessionConfiguration.background(withIdentifier: downloadManagerBackgroundSessionIdentifier)
     return URLSession(configuration: config, delegate: self, delegateQueue: nil)
   }()
 
@@ -51,13 +55,26 @@ public class DownloadManager<Meta: Codable & Equatable>: NSObject, URLSessionDow
   }
 
   public func completeDownload(_ url: URL) {
-    activeDownloads[url] = nil
+    updateActiveDownloadsOnMain { downloads in
+      downloads[url] = nil
+    }
+  }
+
+  public func handleEvents(forBackgroundURLSession identifier: String, completionHandler: @escaping () -> Void) {
+    guard identifier == downloadManagerBackgroundSessionIdentifier else {
+      completionHandler()
+      return
+    }
+
+    backgroundSessionCompletionHandler = completionHandler
+    restoreActiveDownloads()
   }
 
   // MARK: URLSessionDownloadDelegate methods
 
   public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-    guard let sourceURL = downloadTask.originalRequest?.url, let download = activeDownloads[sourceURL] else { return }
+    guard let context = downloadContext(for: downloadTask) else { return }
+    let sourceURL = context.url
     Logger.kit.debug("[DOWNLOAD] Download finished: \(location)")
 
     let destinationURL = fileSaver.getDocumentsDirectoryURL(forFilename: sourceURL.lastPathComponent)
@@ -66,7 +83,7 @@ public class DownloadManager<Meta: Codable & Equatable>: NSObject, URLSessionDow
       try fileSaver.saveFile(from: location, to: destinationURL)
       Logger.kit.info("[DOWNLOAD] File: \(location) moved to documents folder")
 
-      let fileInfo = DownloadedFileInfo(originalURL: sourceURL, localFilename: sourceURL.lastPathComponent, downloadDate: Date(), metadata: download.metadata)
+      let fileInfo = DownloadedFileInfo(originalURL: sourceURL, localFilename: sourceURL.lastPathComponent, downloadDate: Date(), metadata: context.metadata)
       database.save(fileInfo: fileInfo)
     } catch {
       Logger.kit.error("[DOWNLOAD] Error during moving file: \(error)")
@@ -80,19 +97,89 @@ public class DownloadManager<Meta: Codable & Equatable>: NSObject, URLSessionDow
                          didWriteData bytesWritten: Int64,
                          totalBytesWritten: Int64,
                          totalBytesExpectedToWrite: Int64) {
-    if totalBytesExpectedToWrite > 0, let download = activeDownloads[downloadTask.originalRequest?.url ?? URL(fileURLWithPath: "")] {
+    guard totalBytesExpectedToWrite > 0,
+          let url = downloadURL(for: downloadTask),
+          let download = activeDownloads[url] else {
+      return
+    }
+
       let progress = Float(totalBytesWritten) / Float(totalBytesExpectedToWrite)
       Logger.kit.debug("[DOWNLOAD] progress for download: \(download.url), value: \(progress)")
       DispatchQueue.main.async {
         download.updateProgress(progress)
       }
-    }
   }
 
   public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
     if let error = error, let url = task.originalRequest?.url {
       Logger.kit.debug("[DOWNLOAD] Download error for \(url): \(error)")
       completeDownload(url)
+    }
+  }
+
+  public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+    guard session.configuration.identifier == downloadManagerBackgroundSessionIdentifier else {
+      return
+    }
+
+    DispatchQueue.main.async { [weak self] in
+      self?.backgroundSessionCompletionHandler?()
+      self?.backgroundSessionCompletionHandler = nil
+    }
+  }
+
+  private func restoreActiveDownloads() {
+    session.getAllTasks { [weak self] tasks in
+      guard let self else { return }
+
+      let restoredDownloads = tasks.reduce(into: [URL: Download<Meta>]()) { partialResult, task in
+        guard let downloadTask = task as? URLSessionDownloadTask,
+              let descriptor: DownloadTaskDescriptor<Meta> = DownloadTaskDescriptionCoder.decode(downloadTask.taskDescription),
+              task.state != .canceling,
+              task.state != .completed else {
+          return
+        }
+
+        partialResult[descriptor.url] = Download(restoringTask: downloadTask,
+                                                 url: descriptor.url,
+                                                 metadata: descriptor.metadata,
+                                                 manager: self)
+      }
+
+      self.updateActiveDownloadsOnMain { downloads in
+        downloads.merge(restoredDownloads) { current, _ in current }
+      }
+    }
+  }
+
+  private func downloadURL(for task: URLSessionTask) -> URL? {
+    if let url = task.originalRequest?.url {
+      return url
+    }
+
+    let descriptor: DownloadTaskDescriptor<Meta>? = DownloadTaskDescriptionCoder.decode(task.taskDescription)
+    return descriptor?.url
+  }
+
+  private func downloadContext(for task: URLSessionTask) -> DownloadTaskDescriptor<Meta>? {
+    if let url = task.originalRequest?.url,
+       let download = activeDownloads[url] {
+      return DownloadTaskDescriptor(url: url, metadata: download.metadata)
+    }
+
+    let descriptor: DownloadTaskDescriptor<Meta>? = DownloadTaskDescriptionCoder.decode(task.taskDescription)
+    return descriptor
+  }
+
+  private func updateActiveDownloadsOnMain(_ update: @escaping (inout [URL: Download<Meta>]) -> Void) {
+    let performUpdate = {
+      update(&self.activeDownloads)
+    }
+
+    if Thread.isMainThread {
+      performUpdate()
+    } else {
+      DispatchQueue.main.async(execute: performUpdate)
     }
   }
 }

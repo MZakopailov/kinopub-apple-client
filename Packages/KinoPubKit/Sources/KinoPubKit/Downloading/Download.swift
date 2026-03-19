@@ -51,6 +51,15 @@ public class Download<Meta: Codable & Equatable>: ObservableObject {
     self.state = .queued
     Logger.kit.debug("[DOWNLOAD] Download for url: \(url) is queued")
   }
+
+  internal init(restoringTask task: URLSessionDownloadTask, url: URL, metadata: Meta, manager: any DownloadManaging) {
+    self.url = url
+    self.metadata = metadata
+    self.manager = manager
+    self.task = task
+    self.state = task.state == .running ? .inProgress : .paused
+    Logger.kit.debug("[DOWNLOAD] Download for url: \(url) was restored")
+  }
   
   /// Pauses the download. If the download is already paused or not in progress, this method has no effect.
   public func pause() {
@@ -69,6 +78,8 @@ public class Download<Meta: Codable & Equatable>: ObservableObject {
     } else {
       task = manager.session.downloadTask(with: URLRequest(url: url))
     }
+
+    task?.taskDescription = DownloadTaskDescriptionCoder.encode(url: url, metadata: metadata)
     state = .inProgress
     Logger.kit.debug("[DOWNLOAD] Download for url: \(self.url) is in progress")
     task?.resume()

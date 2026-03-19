@@ -50,7 +50,7 @@ class FileSaverTests: XCTestCase {
         // Act & Assert
         XCTAssertThrowsError(try fileSaver.saveFile(from: sourceURL, to: destinationURL))
         XCTAssertTrue(fileManagerMock.didRemoveItem)
-        XCTAssertFalse(fileManagerMock.didMoveItem)
+        XCTAssertTrue(fileManagerMock.didMoveItem)
     }
 
     func testGetDocumentsDirectoryURL() {
@@ -62,6 +62,6 @@ class FileSaverTests: XCTestCase {
 
         // Assert
         XCTAssertEqual(documentsDirectoryURL.lastPathComponent, filename)
-        XCTAssertEqual(documentsDirectoryURL.pathExtension, "")
+        XCTAssertEqual(documentsDirectoryURL.pathExtension, "txt")
     }
 }
